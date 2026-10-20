@@ -9,3 +9,4 @@ I also like doing things that were not intended specifically because they werent
 - Takes Videos (yeah take that nintendo)
 - Manual Photo Exposure (Shutter Speed and ISO)
 - Photo and Video Playback
+- its a camera what else could you possibly need
