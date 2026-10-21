@@ -37,7 +37,7 @@ bool aviWriteFrame(AviWriter *a, uint8_t *chunk);
 // Empty chunk; players repeat the last frame.
 bool aviWriteRepeat(AviWriter *a);
 
-// bytes must be even.
+// bytes should be a multiple of 4 so the frames after it stay word aligned for the SD driver.
 bool aviWriteAudio(AviWriter *a, const void *pcm, uint32_t bytes);
 
 // Rate written on close, e.g. the measured one.

@@ -13,17 +13,20 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 
 #include <fat.h>
 #include <nds.h>
 
 #include "avi.h"
+#include "ui.h"
 
 #define CAM_NDMA    1
 #define PHOTO_DIR   "/DCIM/100DSI00"
 #define PHOTO_W     640
 #define PHOTO_H     480
 #define MAX_MEDIA   1000
+#define PHOTO_FILE_BYTES  (54 + PHOTO_W * PHOTO_H * 3)
 
 // Video - The camera is restarted from the DMA interrupt into a ring of frame buffers
 #define VIDEO_W         256
@@ -32,6 +35,7 @@
 #define VIDEO_BYTES     (VIDEO_W * VIDEO_H * 2)
 #define REC_SLOTS       12                         // 0.75 s
 #define REC_MAX_BYTES   (2000u * 1024 * 1024)      // stay under 2 GB
+#define REC_BYTES_PER_SEC  ((VIDEO_BYTES + 32) * VIDEO_FPS + MIC_RATE * 2 + 64)
 
 // Sound - The ARM7 samples the mic on a timer
 #define MIC_RATE        16000
@@ -56,29 +60,45 @@
 #define GAIN_MIN_32       32
 #define GAIN_MAX_32       256
 #define SLIDER_MAX        255
+#define ROWS_PER_SEC      (704 * VIDEO_FPS)
 
 typedef struct {
-    int col, row, w, h; // in console cells (8x8 px)
+    int x, y, w, h;
     const char *label;
+    u16 color;
+    const char *key;    // physical button, drawn next to the label
 } Button;
 
 // Camera screen
-static const Button btnSnap    = { 2,  1, 13, 4, "PHOTO" };
-static Button       btnRec     = { 17, 1, 13, 4, "REC" };
-static const Button btnGallery = { 2,  5, 13, 3, "GALLERY" };
-static Button       btnExpo    = { 17, 5, 13, 3, "EXP: AUTO" };
-static Button       btnCam     = { 2,  8, 28, 3, "CAMERA: BACK" };
-static const Button sldShutter = { 2, 12, 28, 3, "" };
-static const Button sldGain    = { 2, 17, 28, 3, "" };
+static const Button btnSnap    = { 8,   4,   118, 28, "Photo", UI_RED, "A" };
+static Button       btnRec     = { 130, 4,   118, 28, "Video", UI_BLUE, "B" };
+static Button       btnCam     = { 8,   36,  118, 24, "Back Camera", UI_ORANGE, "SEL" };
+static const Button btnSwap    = { 130, 36,  118, 24, "Swap Screens", UI_PURPLE, "L" };
+static const Button sldShutter = { 8,   107, 240, 14, "", UI_ORANGE, NULL };
+static const Button sldGain    = { 8,   140, 240, 14, "", UI_PURPLE, NULL };
+static Button       btnExpo    = { 8,   158, 118, 30, "Manual Exp", UI_YELLOW, "X" };
+static const Button btnGallery = { 130, 158, 118, 30, "Gallery", UI_GREEN, "Y" };
 // Gallery screen
-static const Button btnPrev    = { 2,  8, 13,  5, "< PREV" };
-static const Button btnNext    = { 17, 8, 13,  5, "NEXT >" };
-static Button       btnPlay    = { 2, 14, 28,  3, "PLAY" };
-static const Button btnBack    = { 2, 18, 28,  3, "BACK TO CAMERA" };
+static const Button btnPrev    = { 8,   4,   118, 28, "Prev", UI_ORANGE, "<" };
+static const Button btnNext    = { 130, 4,   118, 28, "Next", UI_PURPLE, ">" };
+static Button       btnPlay    = { 8,   96,  240, 40, "Play", UI_GREEN, "A" };
+static const Button btnBack    = { 8,   158, 240, 30, "Back to Camera", UI_BLUE, "B" };
 
-#define STATUS_ROW 21
+// Text lines: a left column and a right-aligned one.
+#define LINE_X      10
+#define LINE_Y(n)   (64 + (n) * 14)
+#define GLINE_Y(n)  (38 + (n) * 14)     // gallery
+#define LEFT_W      148
+#define RIGHT_X     158
+#define RIGHT_W     88
+#define LABEL_X     146                 // slider labels, status to their left
+#define LABEL_W     100
+#define KNOB_W      14
 
 typedef enum { MODE_CAMERA, MODE_GALLERY } Mode;
+
+static Mode uiMode;
+static bool swapped;            // viewfinder on the bottom screen
 
 static u16 *topFb;              // 256x192 16-bit framebuffer
 typedef struct {
@@ -90,6 +110,7 @@ static Media media[MAX_MEDIA];  // files found on SD
 static int mediaCount;
 static int current;             // index into media[]
 static bool sdOk;
+static u64 sdFree;              // bytes, updated after saving
 
 static CameraDevice camDevice = CAMERA_OUTER;
 
@@ -157,37 +178,127 @@ static s16 playRingTmp[PLAY_RING];
 // ---------------------------------------------------------------------------
 // UI
 
+#define KEY_H   15
+#define KEY_GAP 5
+
+static int keyWidth(const char *key)
+{
+    int w = uiTextWidth(key) + 7;
+    return w < KEY_H ? KEY_H : w;
+}
+
+static void drawKey(int x, int y, const char *key)
+{
+    int w = keyWidth(key);
+    uiBox(x, y, w, KEY_H, UI_WHITE, UI_BORDER);
+    uiText(x + (w - uiTextWidth(key) + 1) / 2, y + 1, x + w - 1, key, UI_TEXT);
+}
+
+// Key icon and label, centered together.
 static void drawButton(const Button *b)
 {
-    char line[33];
-
-    for (int r = 0; r < b->h; r++)
-    {
-        bool edge = (r == 0 || r == b->h - 1);
-        memset(line + 1, edge ? '-' : ' ', b->w - 2);
-        line[0] = line[b->w - 1] = edge ? '+' : '|';
-        line[b->w] = '\0';
-        printf("\x1b[%d;%dH%s", b->row + r, b->col, line);
-    }
-
-    int len = strlen(b->label);
-    printf("\x1b[%d;%dH%s", b->row + b->h / 2, b->col + (b->w - len) / 2, b->label);
+    uiBox(b->x, b->y, b->w, b->h, b->color, UI_BORDER);
+    int keyW = b->key ? keyWidth(b->key) + KEY_GAP : 0;
+    int x = b->x + (b->w - keyW - uiTextWidth(b->label)) / 2;
+    if (b->key)
+        drawKey(x, b->y + (b->h - KEY_H) / 2, b->key);
+    int y = b->y + (b->h - uiLineHeight()) / 2 + 1;
+    uiText(x + keyW, y, b->x + b->w - 1, b->label, UI_TEXT);
 }
 
 static bool hit(const Button *b, const touchPosition *t)
 {
-    int c = t->px / 8, r = t->py / 8;
-    return c >= b->col && c < b->col + b->w && r >= b->row && r < b->row + b->h;
+    return t->px >= b->x && t->px < b->x + b->w && t->py >= b->y && t->py < b->y + b->h;
+}
+
+// Clears the slot, then draws.
+static void textAt(int x, int y, int w, bool right, u16 color, const char *s)
+{
+    uiFill(x, y, w, uiLineHeight(), UI_WHITE);
+    int tx = right ? x + w - uiTextWidth(s) : x;
+    uiText(tx < x ? x : tx, y, x + w, s, color);
+}
+
+static void statusLine(int y, const char *fmt, va_list args)
+{
+    char buf[64];
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    textAt(LINE_X, y, uiMode == MODE_CAMERA ? LABEL_X - LINE_X - 2 : SCREEN_WIDTH - 2 * LINE_X,
+           false, UI_TEXT, buf);
 }
 
 static void status(const char *fmt, ...)
 {
-    char buf[64];
     va_list args;
     va_start(args, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, args);
+    statusLine(uiMode == MODE_CAMERA ? LINE_Y(2) : GLINE_Y(1), fmt, args);
     va_end(args);
-    printf("\x1b[%d;0H%-31.31s", STATUS_ROW, buf);
+}
+
+// Second status line
+static void detail(const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    statusLine(uiMode == MODE_CAMERA ? sldGain.y - 15 : GLINE_Y(2), fmt, args);
+    va_end(args);
+}
+
+static void refreshFree(void)
+{
+    struct statvfs st;
+    sdFree = sdOk && statvfs(PHOTO_DIR, &st) == 0 ? (u64)st.f_bavail * st.f_frsize : 0;
+}
+
+// What's left on the SD card, and the recording time.
+static void drawInfo(void)
+{
+    if (uiMode != MODE_CAMERA)
+        return;
+
+    char buf[40];
+    u64 free = sdFree;
+    u64 clip = REC_MAX_BYTES;
+    if (recActive)
+    {
+        free = free > recAvi.pos ? free - recAvi.pos : 0;
+        clip = clip > recAvi.pos ? clip - recAvi.pos : 0;
+    }
+
+    if (!sdOk)
+    {
+        textAt(LINE_X, LINE_Y(0), LEFT_W, false, UI_TEXT, "No SD card");
+    }
+    else
+    {
+        unsigned mb = free >> 20;
+        if (mb >= 1024)
+            snprintf(buf, sizeof(buf), "SD Space Left: %u.%u GB", mb / 1024,
+                     mb % 1024 * 10 / 1024);
+        else
+            snprintf(buf, sizeof(buf), "SD Space Left: %u MB", mb);
+        textAt(LINE_X, LINE_Y(0), LEFT_W, false, UI_TEXT, buf);
+
+        unsigned photos = free / PHOTO_FILE_BYTES;
+        if (photos > (unsigned)(MAX_MEDIA - mediaCount))
+            photos = MAX_MEDIA - mediaCount;
+        snprintf(buf, sizeof(buf), "Photos: %u", photos);
+        textAt(LINE_X, LINE_Y(1), 98, false, UI_TEXT, buf);
+
+        unsigned secs = (free < clip ? free : clip) / REC_BYTES_PER_SEC;
+        snprintf(buf, sizeof(buf), "Record Time: %u:%02u:%02u", secs / 3600, secs / 60 % 60,
+                 secs % 60);
+        textAt(110, LINE_Y(1), SCREEN_WIDTH - LINE_X - 110, true, UI_TEXT, buf);
+    }
+
+    buf[0] = '\0';
+    if (recActive)
+    {
+        unsigned secs = recNextSlot / VIDEO_FPS;
+        snprintf(buf, sizeof(buf), "REC: %02u:%02u:%02u", secs / 3600, secs / 60 % 60,
+                 secs % 60);
+    }
+    textAt(RIGHT_X, LINE_Y(0), RIGHT_W, true, UI_REC, buf);
 }
 
 static void mediaName(char *buf, size_t size, const Media *m)
@@ -318,7 +429,7 @@ static void setManualExposure(bool manual)
     }
 
     manualExp = manual;
-    btnExpo.label = manual ? "EXP: MANUAL" : "EXP: AUTO";
+    btnExpo.label = manual ? "Auto Exp" : "Manual Exp";
 }
 
 static void switchCamera(void)
@@ -333,7 +444,7 @@ static void switchCamera(void)
         camDevice = next;
     else
         cameraSelect(camDevice);
-    btnCam.label = camDevice == CAMERA_OUTER ? "CAMERA: BACK" : "CAMERA: FRONT";
+    btnCam.label = camDevice == CAMERA_OUTER ? "Back Camera" : "Front Camera";
 
     // Must be in preview mode before setting exposure.
     cameraStartTransfer(topFb, MCUREG_APT_SEQ_CMD_PREVIEW, CAM_NDMA);
@@ -341,89 +452,92 @@ static void switchCamera(void)
         setManualExposure(true);
 }
 
-static void drawSlider(const Button *s, const char *name, int pos, const char *value)
+// No knob in auto exposure.
+static void drawSlider(const Button *s, const char *label, int pos)
 {
-    printf("\x1b[%d;%dH%-10s%18s", s->row - 1, s->col, name, value);
-    drawButton(s);
-
-    int width = s->w - 2;
-    int knob = pos * (width - 1) / SLIDER_MAX;
-    char track[33];
-    for (int i = 0; i < width; i++)
-        track[i] = i < knob ? '=' : i == knob ? '#' : '-';
-    track[width] = '\0';
-    printf("\x1b[%d;%dH%s", s->row + 1, s->col + 1, track);
+    textAt(LABEL_X, s->y - 15, LABEL_W, true, manualExp ? UI_TEXT : UI_DIM, label);
+    uiBox(s->x, s->y, s->w, s->h, UI_WHITE, UI_BORDER);
+    uiFill(s->x + 6, s->y + s->h / 2, s->w - 12, 1, manualExp ? UI_BORDER : UI_DIM);
+    if (manualExp)
+    {
+        int x = s->x + 6 + pos * (s->w - 12 - KNOB_W) / SLIDER_MAX;
+        uiBox(x, s->y + 3, KNOB_W, s->h - 6, s->color, UI_BORDER);
+    }
 }
 
 static void drawShutterSlider(void)
 {
-    char value[24];
-    snprintf(value, sizeof(value), "%d rows", shutterRows());
-    drawSlider(&sldShutter, "SHUTTER", shutterPos, value);
+    char label[24] = "Shutter: Auto";
+    if (manualExp)
+    {
+        int rows = shutterRows();
+        snprintf(label, sizeof(label), "Shutter: 1/%d", (ROWS_PER_SEC + rows / 2) / rows);
+    }
+    drawSlider(&sldShutter, label, shutterPos);
 }
 
+// ISO 100 = 1x gain.
 static void drawGainSlider(void)
 {
-    char value[24];
-    int g = gain32();
-    snprintf(value, sizeof(value), "%d.%02dx (0x%03X)", g / 32, (g % 32) * 100 / 32,
-             encodeGain(g));
-    drawSlider(&sldGain, "GAIN", gainPos, value);
+    char label[24] = "ISO: Auto";
+    if (manualExp)
+        snprintf(label, sizeof(label), "ISO: %d", gain32() * 100 / 32);
+    drawSlider(&sldGain, label, gainPos);
 }
 
 static int sliderPosAt(const Button *s, int px)
 {
-    int left = (s->col + 1) * 8 + 4;
-    int span = (s->w - 3) * 8;
+    int left = s->x + 6 + KNOB_W / 2;
+    int span = s->w - 12 - KNOB_W;
     int pos = (px - left) * SLIDER_MAX / span;
     return pos < 0 ? 0 : pos > SLIDER_MAX ? SLIDER_MAX : pos;
 }
 
+static void setSwapped(bool on)
+{
+    swapped = on;
+    if (on)
+        lcdMainOnBottom();
+    else
+        lcdMainOnTop();
+}
+
 static void drawUi(Mode mode)
 {
-    consoleClear();
+    uiMode = mode;
+    uiFill(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, UI_WHITE);
 
     if (mode == MODE_CAMERA)
     {
         drawButton(&btnSnap);
         drawButton(&btnRec);
-        drawButton(&btnGallery);
-        drawButton(&btnExpo);
         drawButton(&btnCam);
-        if (manualExp)
-        {
-            drawShutterSlider();
-            drawGainSlider();
-        }
-        else
-        {
-            printf("\x1b[14;2HAuto exposure");
-        }
-        printf("\x1b[23;0HA:pic B:rec Y:gal X:exp SEL:cam");
-        if (!sdOk)
-            status("No SD card: can't save photos");
+        drawButton(&btnSwap);
+        drawInfo();
+        drawShutterSlider();
+        drawGainSlider();
+        drawButton(&btnExpo);
+        drawButton(&btnGallery);
     }
     else
     {
-        printf("\x1b[1;1HGALLERY");
-        bool video = mediaCount > 0 && media[current].video;
         if (mediaCount > 0)
         {
-            char name[16];
-            mediaName(name, sizeof(name), &media[current]);
-            printf("\x1b[3;1H%d / %d", current + 1, mediaCount);
-            printf("\x1b[4;1H%s", name);
+            char buf[16];
+            mediaName(buf, sizeof(buf), &media[current]);
+            textAt(LINE_X, GLINE_Y(0), LEFT_W, false, UI_TEXT, buf);
+            snprintf(buf, sizeof(buf), "%d / %d", current + 1, mediaCount);
+            textAt(RIGHT_X, GLINE_Y(0), RIGHT_W, true, UI_TEXT, buf);
         }
         else
         {
-            printf("\x1b[3;1HNo photos or videos yet");
+            textAt(LINE_X, GLINE_Y(0), LEFT_W, false, UI_TEXT, "No photos or videos yet");
         }
         drawButton(&btnPrev);
         drawButton(&btnNext);
-        if (video)
+        if (mediaCount > 0 && media[current].video)
             drawButton(&btnPlay);
         drawButton(&btnBack);
-        printf("\x1b[23;0H%s", video ? "L/R:browse A:play B:back" : "Left/Right: browse  B: back");
     }
 }
 
@@ -627,7 +741,7 @@ static void takePhoto(void)
 {
     if (!sdOk)
     {
-        status("No SD card: can't save photos");
+        status("No SD card");
         return;
     }
     if (mediaCount >= MAX_MEDIA)
@@ -665,7 +779,7 @@ static void takePhoto(void)
     if (!captured)
     {
         free(yuv);
-        status("Capture failed, try again");
+        status("Capture failed");
         return;
     }
 
@@ -680,6 +794,8 @@ static void takePhoto(void)
     if (ok)
     {
         addMedia(m);
+        refreshFree();
+        drawInfo();
         status("Saved IMG_%04d.BMP", m.num);
     }
     else
@@ -722,20 +838,21 @@ static u32 clockNow(void)
 
 // cameraStartTransfer() for preview plus an NDMA interrupt. Register writes only, so safe in an interrupt.
 // The camera must already be in preview mode.
+// One scanline per DMA block instead of libnds' 4, so the FIFO has room while SD writes hold up the bus.
 static void recStartFrame(u16 *buf)
 {
     DC_InvalidateRange(buf, VIDEO_BYTES);
 
     REG_CAM_CNT &= ~CAM_CNT_TRANSFER_ENABLE;
     REG_CAM_CNT &= ~0x200F;
-    REG_CAM_CNT |= CAM_CNT_FORMAT_RGB | CAM_CNT_SCANLINES(4);
+    REG_CAM_CNT |= CAM_CNT_FORMAT_RGB | CAM_CNT_SCANLINES(1);
     REG_CAM_CNT |= CAM_CNT_TRANSFER_FLUSH;
     REG_CAM_CNT |= CAM_CNT_TRANSFER_ENABLE;
 
     REG_NDMA_SRC(CAM_NDMA) = (u32)&REG_CAM_DATA;
     REG_NDMA_DEST(CAM_NDMA) = (u32)buf;
     REG_NDMA_LENGTH(CAM_NDMA) = VIDEO_BYTES / 4;
-    REG_NDMA_BLENGTH(CAM_NDMA) = 512;
+    REG_NDMA_BLENGTH(CAM_NDMA) = VIDEO_W * 2 / 4;
     REG_NDMA_BDELAY(CAM_NDMA) = 2;
     REG_NDMA_CR(CAM_NDMA) = NDMA_SRC_FIX | NDMA_BLOCK_SCALER(4) | NDMA_START_CAMERA
                           | NDMA_IRQ_REQ | NDMA_ENABLE;
@@ -766,15 +883,18 @@ static void recFrameDone(void)
     recStartFrame(recSlot[recHead]);
 }
 
-// Bottom-up, red/blue swapped (AVI keeps blue in the low bits).
-static void toAviFrame(const u16 *src, u32 *dst)
+// Bottom-up, red/blue swapped (AVI keeps blue in the low bits). Also copies the frame to the screen.
+// No dmaCopy(): old DMA outranks the camera's NDMA and a 96 KB copy overruns the camera FIFO.
+static void toAviFrame(const u16 *src, u32 *dst, u16 *screen)
 {
     for (int y = VIDEO_H - 1; y >= 0; y--)
     {
         const u32 *s = (const u32 *)(src + y * VIDEO_W);
+        u32 *v = (u32 *)(screen + y * VIDEO_W);
         for (int x = 0; x < VIDEO_W / 2; x++)
         {
             u32 p = s[x]; // two pixels
+            v[x] = p;
             *dst++ = ((p & 0x001F001F) << 10) | ((p >> 10) & 0x001F001F) | (p & 0x03E003E0);
         }
     }
@@ -814,6 +934,8 @@ static void startMic(void)
 }
 
 // Sound before the first video frame is dropped so they line up.
+// Chunks stay multiples of 4 bytes: the SD driver is much slower with unaligned buffers, and with
+// the mic also loading the ARM7 recording falls behind and stalls.
 static bool micService(void)
 {
     if (micSkip > 0)
@@ -850,7 +972,7 @@ static void startRecording(void)
 {
     if (!sdOk)
     {
-        status("No SD card: can't record");
+        status("No SD card");
         return;
     }
     if (mediaCount >= MAX_MEDIA)
@@ -882,7 +1004,7 @@ static void startRecording(void)
             fclose(recAvi.f);
         recAvi.f = NULL;
         freeRecBuffers();
-        status("Couldn't create %s", recName);
+        status("Can't create file");
         return;
     }
     addMedia(recMedia); // the file exists even if recording fails
@@ -903,18 +1025,18 @@ static void startRecording(void)
     recActive = true;
     recStartFrame(recSlot[recHead]);
 
-    btnRec.label = "STOP";
+    btnRec.label = "Stop";
     drawButton(&btnRec);
-    printf("\x1b[%d;0H%-31s", STATUS_ROW + 1, "");
-    status("REC %s", recName);
+    drawInfo();
+    detail("");
+    status("%s", recName);
 }
 
 // Restarts a stalled capture. The interrupt only fires on completed frames.
 static void recWatchdog(void)
 {
     int ime = enterCriticalSection();
-    bool stuck = cameraStalled()
-              || (ndmaBusy(CAM_NDMA) && clockNow() - recLastFrame > CLOCK_HZ / 2);
+    bool stuck = cameraStalled() || clockNow() - recLastFrame > CLOCK_HZ / 2;
     if (stuck)
     {
         abortCamera();
@@ -941,7 +1063,7 @@ static const char *recService(void)
             recBase = t;
             recHaveBase = true;
             u32 samples = (u64)(t - micStartTime) * MIC_RATE_REAL / CLOCK_HZ;
-            micSkip = samples * 2;
+            micSkip = samples * 2 & ~3u;
         }
         u32 slot = ((u64)(t - recBase) * VIDEO_FPS + CLOCK_HZ / 2) / CLOCK_HZ;
 
@@ -955,8 +1077,7 @@ static const char *recService(void)
                 recRepeats++;
             }
 
-            dmaCopy(frame, topFb, VIDEO_BYTES);
-            toAviFrame(frame, (u32 *)(recChunk + AVI_CHUNK_HEADER));
+            toAviFrame(frame, (u32 *)(recChunk + AVI_CHUNK_HEADER), topFb);
             ok = ok && aviWriteFrame(&recAvi, recChunk);
             recNextSlot++;
         }
@@ -967,20 +1088,22 @@ static const char *recService(void)
         leaveCriticalSection(ime);
 
         if (!ok)
-            return "SD write failed (card full?)";
+            return "SD write failed";
         if (recAvi.pos + (recAvi.indexCount + 2) * 16 + VIDEO_BYTES * 2 > REC_MAX_BYTES)
             return "Size limit reached";
     }
 
     if (recHaveBase && !micService())
-        return "SD write failed (card full?)";
+        return "SD write failed";
 
     int secs = recNextSlot / VIDEO_FPS;
     if (secs != recLastStatus)
     {
         recLastStatus = secs;
-        status("REC %d:%02d %uMB rep %d", secs / 60, secs % 60,
-               (unsigned)(recAvi.pos >> 20), recRepeats);
+        drawInfo();
+        status("%s %u MB", recName, (unsigned)(recAvi.pos >> 20));
+        if (recRepeats)
+            detail("rep %d", recRepeats);
     }
     return NULL;
 }
@@ -992,8 +1115,10 @@ static void stopRecording(const char *reason)
     recActive = false;
     abortCamera();
     irqDisable(IRQ_NDMA(CAM_NDMA));
+    bool micWasOn = micActive;
     micActive = false;
-    soundMicOff();
+    if (micWasOn)
+        soundMicOff();
 
     if (reason == NULL)
         reason = recService(); // flush the queue
@@ -1012,20 +1137,32 @@ static void stopRecording(const char *reason)
     freeRecBuffers();
     clockStop();
 
-    btnRec.label = "REC";
+    btnRec.label = "Video";
     drawButton(&btnRec);
+    refreshFree();
+    drawInfo();
 
     int secs = frames / VIDEO_FPS;
     if (!ok)
-        status("Error saving %s", recName);
+        status("Save failed");
     else if (reason)
         status("%s", reason);
     else
-        status("%s %d:%02d rep %d", recName, secs / 60, secs % 60, recRepeats);
+        status("%s %d:%02d", recName, secs / 60, secs % 60);
 
-    if (recErrors || recStalls || recOverflows || micOverflows)
-        printf("\x1b[%d;0Htorn %d stall %d SD %d mic %d", STATUS_ROW + 1, recErrors,
-               recStalls, recOverflows, micOverflows);
+    // Nonzero problem counts
+    char counts[64] = "";
+    const char *names[] = { "rep", "torn", "stall", "SD", "mic" };
+    const int values[] = { recRepeats, recErrors, recStalls, recOverflows, micOverflows };
+    for (int i = 0; i < 5; i++)
+    {
+        if (values[i])
+        {
+            size_t len = strlen(counts);
+            snprintf(counts + len, sizeof(counts) - len, "%s %d  ", names[i], values[i]);
+        }
+    }
+    detail("%s", counts);
 }
 
 // ---------------------------------------------------------------------------
@@ -1345,7 +1482,7 @@ static void playerSetPlaying(bool playing)
         clockStop();
     }
     player.playing = playing;
-    btnPlay.label = playing ? "PAUSE" : "PLAY";
+    btnPlay.label = playing ? "Pause" : "Play";
     drawButton(&btnPlay);
 }
 
@@ -1394,7 +1531,7 @@ static void playerTick(void)
 static void showCurrent(void)
 {
     playerClose();
-    btnPlay.label = "PLAY";
+    btnPlay.label = "Play";
 
     if (mediaCount == 0)
     {
@@ -1409,16 +1546,21 @@ static void showCurrent(void)
     if (media[current].video)
     {
         memset(topFb, 0, 256 * SCREEN_HEIGHT * sizeof(u16));
-        if (playerOpen(path) && playerStep(true))
+        if (!playerOpen(path))
+        {
+            playerClose();
+            status("Couldn't open video");
+        }
+        else if (!playerStep(true))
+        {
+            playerClose();
+            status("Video has no frames");
+        }
+        else
         {
             // First frame stays as a poster.
             player.pos = player.moviPos;
             playerStatus();
-        }
-        else
-        {
-            playerClose();
-            status("Couldn't open video");
         }
     }
     else if (showBmp(path))
@@ -1433,7 +1575,9 @@ static void showCurrent(void)
 
 static void halt(const char *msg)
 {
-    printf("\n%s\n\nPress START to exit.\n", msg);
+    uiFill(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, UI_WHITE);
+    uiText(LINE_X, LINE_Y(0), SCREEN_WIDTH, msg, UI_TEXT);
+    uiText(LINE_X, LINE_Y(2), SCREEN_WIDTH, "Press START to exit.", UI_TEXT);
     while (true)
     {
         swiWaitForVBlank();
@@ -1447,7 +1591,7 @@ static void halt(const char *msg)
 
 int main(int argc, char **argv)
 {
-    consoleDemoInit(); // bottom screen text console
+    uiInit();
 
     vramSetBankA(VRAM_A_MAIN_BG);
     videoSetMode(MODE_5_2D);
@@ -1463,6 +1607,7 @@ int main(int argc, char **argv)
         mkdir("/DCIM", 0777);
         mkdir(PHOTO_DIR, 0777);
         scanMedia();
+        refreshFree();
     }
 
     if (!cameraInit())
@@ -1510,15 +1655,26 @@ int main(int argc, char **argv)
                     cameraStartTransfer(topFb, MCUREG_APT_SEQ_CMD_PREVIEW, CAM_NDMA);
             }
 
+            // The viewfinder is on the touch screen: any tap swaps back.
+            if (swapped && touched)
+            {
+                setSwapped(false);
+                touched = false;
+            }
+
             bool rec = recActive;
-            if ((down & KEY_B) || (touched && hit(&btnRec, &touch)))
+            if ((down & KEY_L) || (touched && hit(&btnSwap, &touch)))
+            {
+                setSwapped(!swapped);
+            }
+            else if ((down & KEY_B) || (touched && hit(&btnRec, &touch)))
             {
                 if (rec)
                     stopRecording(NULL);
                 else
                     startRecording();
             }
-            else if (!rec && ((down & (KEY_A | KEY_L | KEY_R))
+            else if (!rec && ((down & (KEY_A | KEY_R))
                               || (touched && hit(&btnSnap, &touch))))
             {
                 takePhoto();
@@ -1536,6 +1692,7 @@ int main(int argc, char **argv)
             else if (!rec && ((down & KEY_Y) || (touched && hit(&btnGallery, &touch))))
             {
                 stopPreview();
+                setSwapped(false);
                 mode = MODE_GALLERY;
                 current = mediaCount - 1; // start on the newest
                 if (current < 0)
